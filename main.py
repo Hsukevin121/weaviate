@@ -4,60 +4,94 @@ from typing import List
 import requests
 import fitz  # PyMuPDF
 import json
+import logging
+
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import torch
+
+# 設定 logger
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# 初始化 rerank 模型
+tokenizer = AutoTokenizer.from_pretrained("BAAI/bge-reranker-v2-m3")
+model = AutoModelForSequenceClassification.from_pretrained("BAAI/bge-reranker-v2-m3")
+model.eval()
+
+# 封裝 rerank 函數
+def rerank(query: str, documents: list[str], top_k: int = 5, threshold: float = 0.8):
+    pairs = [(query, doc) for doc in documents]
+    inputs = tokenizer(pairs, padding=True, truncation=True, return_tensors="pt")
+    with torch.no_grad():
+        scores = model(**inputs).logits.squeeze(-1).tolist()
+
+    ranked = sorted(zip(documents, scores), key=lambda x: x[1], reverse=True)
+    return [{"text": doc, "score": score} for doc, score in ranked if score >= threshold][:top_k]
 
 app = FastAPI()
 
-OLLAMA_URL = "http://192.168.31.124:11434/api"
+OLLAMA_URL = "http://192.168.31.129:11434/api"
 WEAVIATE_OBJECTS_URL = "http://localhost:8080/v1/objects"
 WEAVIATE_GRAPHQL_URL = "http://localhost:8080/v1/graphql"
 
-# Helper: 修正時間格式
 def get_rfc3339_time():
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
-# 1. 插入記憶
 @app.post("/remember")
 def remember(data: dict = Body(...)):
-    text = data["text"]
-    vector = requests.post(f"{OLLAMA_URL}/embeddings", json={"model": "nomic-embed-text", "prompt": text}).json()["embedding"]
+    try:
+        text = data["text"]
+        vector = requests.post(f"{OLLAMA_URL}/embeddings", json={"model": "nomic-embed-text", "prompt": text}).json()["embedding"]
+        obj = {
+            "class": "Knowledge",
+            "properties": {
+                "text": text,
+                "type": data.get("type", "fact"),
+                "tag": data.get("tag", []),
+                "domain": data.get("domain", "chat"),
+                "source_doc": data.get("source_doc", "chat"),
+                "created_at": data.get("created_at", get_rfc3339_time()),
+                "related_event": data.get("related_event", ""),
+                "user": data.get("user", "default")
+            },
+            "vector": vector
+        }
+        return requests.post(WEAVIATE_OBJECTS_URL, json=obj).json()
+    except Exception as e:
+        logger.error(f"[remember] error: {e}")
+        return {"error": "embedding or insertion failed", "exception": str(e)}
 
-    obj = {
-        "class": "Knowledge",
-        "properties": {
-            "text": text,
-            "type": data.get("type", "fact"),
-            "tag": data.get("tag", []),
-            "domain": data.get("domain", "chat"),
-            "source_doc": data.get("source_doc", "chat"),
-            "created_at": data.get("created_at", get_rfc3339_time()),
-            "related_event": data.get("related_event", ""),
-            "user": data.get("user", "default")
-        },
-        "vector": vector
-    }
-    return requests.post(WEAVIATE_OBJECTS_URL, json=obj).json()
-
-# 2. 查詢記憶
 @app.post("/recall")
 def recall(data: dict = Body(...)):
-    text = data["text"]
-    vector = requests.post(f"{OLLAMA_URL}/embeddings", json={"model": "nomic-embed-text", "prompt": text}).json()["embedding"]
+    try:
+        query = data["text"]
+        emb = requests.post(f"{OLLAMA_URL}/embeddings", json={"model": "nomic-embed-text", "prompt": query}).json()
+        vector = emb["embedding"]
 
-    query = {
-        "query": f"""
-        {{
-          Get {{
-            Knowledge(
-              nearVector: {{ vector: {vector} }},
-              limit: 5
-            ) {{
-              text type tag domain user source_doc created_at
-              _additional {{ id certainty }}
-            }}
-          }}
-        }}"""
-    }
-    return requests.post(WEAVIATE_GRAPHQL_URL, json=query).json()
+        query_body = {
+            "query": f"""
+            {{
+              Get {{
+                Knowledge(nearVector: {{ vector: {vector} }}, limit: 20) {{
+                  text source_doc created_at _additional {{ id certainty }}
+                }}
+              }}
+            }}"""
+        }
+        res = requests.post(WEAVIATE_GRAPHQL_URL, json=query_body).json()
+        candidates = res.get("data", {}).get("Get", {}).get("Knowledge", [])
+        docs = [c["text"] for c in candidates]
+
+        top_docs = rerank(query, docs, top_k=5, threshold=0.8)
+
+        return {
+            "query": query,
+            "selected_docs": top_docs,
+            "raw_candidates": docs[:10]
+        }
+    except Exception as e:
+        logger.error(f"[recall] error: {e}")
+        return {"error": "recall failed", "exception": str(e)}
 
 # 3. 手動標記
 @app.post("/label")
