@@ -1,13 +1,18 @@
-from fastapi import FastAPI, Body, UploadFile, File
+from fastapi import FastAPI, Body, UploadFile, File, Form
 from datetime import datetime, timedelta
 from typing import List
 import requests
 import fitz  # PyMuPDF
 import json
 import logging
+import docx
+import os
 
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import torch
+
+from fastapi.middleware.cors import CORSMiddleware # 跨域
+
 
 # 設定 logger
 logging.basicConfig(level=logging.INFO)
@@ -29,6 +34,14 @@ def rerank(query: str, documents: list[str], top_k: int = 5, threshold: float = 
     return [{"text": doc, "score": score} for doc, score in ranked if score >= threshold][:top_k]
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 OLLAMA_URL = "http://192.168.31.129:11434/api"
 WEAVIATE_OBJECTS_URL = "http://localhost:8080/v1/objects"
@@ -160,13 +173,31 @@ def query_by_filter(data: dict = Body(...)):
     return requests.post(WEAVIATE_GRAPHQL_URL, json=query).json()
 
 # 7. PDF 拆段上傳
-@app.post("/upload_pdf")
-def upload_pdf(file: UploadFile):
+@app.post("/upload_file")
+def upload_file(file: UploadFile, domain: str = Form("General")):
     text_blocks = []
-    doc = fitz.open(stream=file.file.read(), filetype="pdf")
-    for page in doc:
-        text_blocks += [p.strip() for p in page.get_text().split("\n") if len(p.strip()) >= 30]
+    filename = file.filename.lower()
 
+    # 1. PDF 處理
+    if filename.endswith(".pdf"):
+        doc = fitz.open(stream=file.file.read(), filetype="pdf")
+        for page in doc:
+            text_blocks += [p.strip() for p in page.get_text().split("\n") if len(p.strip()) >= 30]
+
+    # 2. TXT 處理
+    elif filename.endswith(".txt"):
+        content = file.file.read().decode("utf-8", errors="ignore")
+        text_blocks = [line.strip() for line in content.splitlines() if len(line.strip()) >= 30]
+
+    # 3. DOCX 處理
+    elif filename.endswith(".docx"):
+        doc = docx.Document(file.file)
+        text_blocks = [p.text.strip() for p in doc.paragraphs if len(p.text.strip()) >= 30]
+
+    else:
+        return {"error": "不支援的檔案格式"}
+
+    # 上傳向量
     success, fail = 0, 0
     for block in text_blocks:
         emb_res = requests.post(f"{OLLAMA_URL}/embeddings", json={"model": "nomic-embed-text", "prompt": block})
@@ -179,8 +210,8 @@ def upload_pdf(file: UploadFile):
             "properties": {
                 "text": block,
                 "type": "doc",
-                "tag": ["pdf"],
-                "domain": "FlexRIC",
+                "tag": [os.path.splitext(filename)[1].replace('.', '')],  # 動態標記來源格式
+                "domain": domain,
                 "source_doc": file.filename,
                 "created_at": get_rfc3339_time(),
                 "user": "system"
@@ -189,6 +220,7 @@ def upload_pdf(file: UploadFile):
         }
         res = requests.post(WEAVIATE_OBJECTS_URL, json=obj)
         success += 1 if res.status_code == 200 else 0
+
     return {"filename": file.filename, "total": len(text_blocks), "success": success, "fail": fail}
 
 # 8. 查詢使用者記憶

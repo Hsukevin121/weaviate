@@ -1,5 +1,7 @@
 fastapi
 uvicorn
 requests
-PyMuPDF 
-python-multipart 
+PyMuPDF
+python-docx
+transformers
+torch
