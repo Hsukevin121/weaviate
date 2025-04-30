@@ -75,7 +75,7 @@ Run Weaviate with Docker
 pip install fastapi uvicorn requests
 pip install -r requirements.txt
 ```
-**Step 2 :** Run
+**Step 1 :** Run
 ```=
 uvicorn main:app --host 0.0.0.0 --port 8500
 ```
