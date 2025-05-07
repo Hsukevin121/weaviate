@@ -1,162 +1,81 @@
-import re
-import json
-import logging
-import os
-from datetime import datetime
+from fastapi import FastAPI, Body, UploadFile, File
+from datetime import datetime, timedelta
+from typing import List
 import requests
 import fitz  # PyMuPDF
-import docx
-from fastapi import FastAPI, Body, UploadFile, File, Form
+import json
+import logging
 from fastapi.middleware.cors import CORSMiddleware
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import torch
+from docx import Document
 
-# === Logger ===
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler()]
-)
+# 設定 logger
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-OLLAMA_URL = "http://192.168.31.124:11434/api"
-WEAVIATE_OBJECTS_URL = "http://localhost:8080/v1/objects"
+# 初始化 rerank 模型
+tokenizer = AutoTokenizer.from_pretrained("BAAI/bge-reranker-v2-m3")
+model = AutoModelForSequenceClassification.from_pretrained("BAAI/bge-reranker-v2-m3")
+model.eval()
 
-# === 工具函式 ===
-def get_rfc3339_time():
-    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+# 封裝 rerank 函數
+def rerank(query: str, documents: list[str], top_k: int = 5, threshold: float = 0.8):
+    pairs = [(query, doc) for doc in documents]
+    inputs = tokenizer(pairs, padding=True, truncation=True, return_tensors="pt")
+    with torch.no_grad():
+        scores = model(**inputs).logits.squeeze(-1).tolist()
 
-def error_response(msg: str, e: Exception = None, detail: dict = None):
-    return {
-        "status": "error",
-        "message": msg,
-        "exception": str(e) if e else None,
-        "detail": detail or {}
-    }
+    ranked = sorted(zip(documents, scores), key=lambda x: x[1], reverse=True)
+    return [{"text": doc, "score": score} for doc, score in ranked if score >= threshold][:top_k]
 
-def get_embedding(text: str, model_name: str = "nomic-embed-text"):
-    try:
-        res = requests.post(f"{OLLAMA_URL}/embeddings", json={"model": model_name, "prompt": text}, timeout=10)
-        res.raise_for_status()
-        return res.json()["embedding"]
-    except Exception as e:
-        logger.error(f"[embedding error] {e}")
-        raise
-
-def extract_json_from_llm_response(text: str) -> dict:
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if not match:
-        raise ValueError("無法從 LLM 回應中解析 JSON 區塊")
-    return json.loads(match.group())
-
-def suggest_label(text: str):
-    prompt = (
-        "請你根據以下內容，輸出分類 type 和 tag。\n"
-        "- 回傳格式：{\"type\": \"fact\", \"tag\": [\"flexric\"]}\n"
-        "- type 請從 fact, policy, task, doc 選一\n"
-        "- tag 請用陣列方式回傳，並且內容為英文詞\n\n"
-        f"內容如下：\n{text}"
-    )
-    try:
-        res = requests.post(
-            f"{OLLAMA_URL}/generate",
-            json={"model": "myaniu/qwen2.5-1m:7b", "prompt": prompt, "stream": False},
-            timeout=20
-        )
-        res.raise_for_status()
-        content = res.json().get("response")
-        if not content:
-            raise ValueError("缺少 'response' 欄位")
-        parsed = extract_json_from_llm_response(content)
-        if isinstance(parsed.get("tag"), str):
-            parsed["tag"] = [parsed["tag"]]
-        return parsed
-    except Exception as e:
-        logger.warning(f"[suggest_label fallback] {e}")
-        return {"type": "doc", "tag": []}  # fallback
-
-def insert_to_weaviate(text: str, vector: list, metadata: dict):
-    obj = {
-        "class": "Knowledge",
-        "properties": {
-            "text": text,
-            **metadata
-        },
-        "vector": vector
-    }
-    return requests.post(WEAVIATE_OBJECTS_URL, json=obj, timeout=10)
-
-def process_paragraph_block(text_block: str, filename: str, domain: str):
-    try:
-        embedding = get_embedding(text_block)
-        label_info = suggest_label(text_block)
-
-        metadata = {
-            "type": label_info.get("type", "doc"),
-            "tag": label_info.get("tag", [os.path.splitext(filename)[1].replace('.', '')]),
-            "domain": domain,
-            "source_doc": filename,
-            "created_at": get_rfc3339_time(),
-            "user": "system"
-        }
-
-        response = insert_to_weaviate(text_block, embedding, metadata)
-        return response.status_code == 200
-
-    except Exception as e:
-        logger.error(f"[process block error] {e}")
-        return False
-
-# === FastAPI 應用 ===
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # 或指定 http://192.168.31.132:5173 更安全
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+OLLAMA_URL = "http://192.168.31.124:11434/api"
+WEAVIATE_OBJECTS_URL = "http://localhost:8080/v1/objects"
+WEAVIATE_GRAPHQL_URL = "http://localhost:8080/v1/graphql"
 
-@app.post("/upload_file")
-def upload_file(
-    file: UploadFile = File(...),
-    domain: str = Form("General"),
-    user_tag: str = Form("")
-):
+def get_rfc3339_time():
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+@app.post("/remember")
+def remember(data: dict = Body(...)):
     try:
-        text_blocks = []
-        filename = file.filename.lower()
-
-        if filename.endswith(".pdf"):
-            doc = fitz.open(stream=file.file.read(), filetype="pdf")
-            for page in doc:
-                text_blocks += [p.strip() for p in page.get_text().split("\n") if len(p.strip()) >= 30]
-        elif filename.endswith(".txt"):
-            content = file.file.read().decode("utf-8", errors="ignore")
-            text_blocks = [line.strip() for line in content.splitlines() if len(line.strip()) >= 30]
-        elif filename.endswith(".docx"):
-            doc = docx.Document(file.file)
-            text_blocks = [p.text.strip() for p in doc.paragraphs if len(p.text.strip()) >= 30]
-        else:
-            return error_response("不支援的檔案格式")
-
-        success, fail = 0, 0
-        for block in text_blocks:
-            ok = process_paragraph_block(block, filename=file.filename, domain=domain, user_tag=user_tag)
-            if ok:
-                success += 1
-            else:
-                fail += 1
-
-        return {"filename": file.filename, "total": len(text_blocks), "success": success, "fail": fail}
+        text = data["text"]
+        vector = requests.post(f"{OLLAMA_URL}/embeddings", json={"model": "nomic-embed-text", "prompt": text}).json()["embedding"]
+        obj = {
+            "class": "Knowledge",
+            "properties": {
+                "text": text,
+                "type": data.get("type", "fact"),
+                "tag": data.get("tag", []),
+                "domain": data.get("domain", "chat"),
+                "source_doc": data.get("source_doc", "chat"),
+                "created_at": data.get("created_at", get_rfc3339_time()),
+                "related_event": data.get("related_event", ""),
+                "user": data.get("user", "default")
+            },
+            "vector": vector
+        }
+        return requests.post(WEAVIATE_OBJECTS_URL, json=obj).json()
     except Exception as e:
-        return error_response("file upload failed", e)
+        logger.error(f"[remember] error: {e}")
+        return {"error": "embedding or insertion failed", "exception": str(e)}
 
 @app.post("/recall")
 def recall(data: dict = Body(...)):
     try:
         query = data["text"]
-        vector = get_embedding(query)
+        emb = requests.post(f"{OLLAMA_URL}/embeddings", json={"model": "nomic-embed-text", "prompt": query}).json()
+        vector = emb["embedding"]
 
-        graphql_query = {
+        query_body = {
             "query": f"""
             {{
               Get {{
@@ -166,16 +85,178 @@ def recall(data: dict = Body(...)):
               }}
             }}"""
         }
-        res = requests.post(WEAVIATE_GRAPHQL_URL, json=graphql_query).json()
+        res = requests.post(WEAVIATE_GRAPHQL_URL, json=query_body).json()
         candidates = res.get("data", {}).get("Get", {}).get("Knowledge", [])
         docs = [c["text"] for c in candidates]
 
-        top_docs = rerank(query, docs)
+        top_docs = rerank(query, docs, top_k=5, threshold=0.8)
 
         return {
             "query": query,
-            "results": top_docs,
-            "raw": candidates[:10]
+            "selected_docs": top_docs,
+            "raw_candidates": docs[:10]
         }
     except Exception as e:
-        return error_response("recall failed", e)
+        logger.error(f"[recall] error: {e}")
+        return {"error": "recall failed", "exception": str(e)}
+
+# 3. 手動標記
+@app.post("/label")
+def label(data: dict = Body(...)):
+    object_id = data["id"]
+    patch_data = {"properties": data["properties"]}
+    res = requests.patch(f"{WEAVIATE_OBJECTS_URL}/Knowledge/{object_id}", json=patch_data)
+    if res.status_code == 204:
+        return {"status": "success", "id": object_id}
+    try:
+        return res.json()
+    except Exception:
+        return {"error": "patch failed", "status_code": res.status_code, "raw": res.text}
+
+# 4. 建議 label（LLM 判斷）
+@app.post("/suggest_label")
+def suggest_label(data: dict = Body(...)):
+    text = data["text"]
+    prompt = (
+        "請你根據以下內容，輸出分類 type 和 tag。\n"
+        "- 回傳格式：{\"type\": \"fact\", \"tag\": [\"flexric\"]}\n"
+        "- type 請從 fact, policy, task, doc 選一\n"
+        "- tag 請用陣列方式回傳，並且內容為英文詞\n\n"
+        f"內容如下：\n{text}"
+    )
+    res = requests.post(f"{OLLAMA_URL}/generate", json={"model": "llama3.1:latest", "prompt": prompt, "stream": False})
+    try:
+        content = res.json()["response"]
+        json_str = content[content.find("{"):content.rfind("}")+1]
+        result = json.loads(json_str)
+        if isinstance(result.get("tag"), str):
+            result["tag"] = [result["tag"]]
+        return result
+    except Exception as e:
+        return {"error": "解析 LLM 回應失敗", "raw": res.text, "exception": str(e)}
+
+# 5. 刪除記憶
+@app.delete("/delete/{object_id}")
+def delete(object_id: str):
+    res = requests.delete(f"{WEAVIATE_OBJECTS_URL}/{object_id}")
+    return {"status": "success", "id": object_id} if res.status_code == 204 else {"status": "fail", "code": res.status_code, "reason": res.text}
+
+# 6. 條件查詢
+@app.post("/query_by_filter")
+def query_by_filter(data: dict = Body(...)):
+    where_clause = []
+    for key in ["type", "domain"]:
+        if key in data:
+            where_clause.append(f'{{path: ["{key}"], operator: Equal, valueText: "{data[key]}"}}')
+    if "tag" in data:
+        tags = json.dumps(data["tag"])
+        where_clause.append(f'{{path: ["tag"], operator: ContainsAny, valueText: {tags}}}')
+
+    where_str = f'where: {{operands: [{", ".join(where_clause)}], operator: And}}' if where_clause else ""
+
+    query = {
+        "query": f"""
+        {{
+          Get {{
+            Knowledge({where_str}) {{
+              text type tag domain user created_at _additional {{ id }}
+            }}
+          }}
+        }}"""
+    }
+    return requests.post(WEAVIATE_GRAPHQL_URL, json=query).json()
+
+# 7. PDF 拆段上傳
+@app.post("/upload_file")
+def upload_file(file: UploadFile):
+    text_blocks = []
+    filename = file.filename.lower()
+
+    if filename.endswith(".pdf"):
+        doc = fitz.open(stream=file.file.read(), filetype="pdf")
+        for page in doc:
+            text_blocks += [p.strip() for p in page.get_text().split("\n") if len(p.strip()) >= 30]
+
+    elif filename.endswith(".docx"):
+        doc = Document(file.file)
+        for para in doc.paragraphs:
+            if len(para.text.strip()) >= 30:
+                text_blocks.append(para.text.strip())
+
+    elif filename.endswith(".txt"):
+        content = file.file.read().decode("utf-8")
+        text_blocks += [line.strip() for line in content.split("\n") if len(line.strip()) >= 30]
+
+    else:
+        return {"error": "Unsupported file type"}
+
+    success, fail = 0, 0
+    for block in text_blocks:
+        emb_res = requests.post(f"{OLLAMA_URL}/embeddings", json={"model": "nomic-embed-text", "prompt": block})
+        if emb_res.status_code != 200:
+            fail += 1
+            continue
+        vector = emb_res.json()["embedding"]
+        obj = {
+            "class": "Knowledge",
+            "properties": {
+                "text": block,
+                "type": "doc",
+                "tag": [filename.split(".")[-1]],  # 使用檔案副檔名作為 tag (pdf, docx, txt)
+                "domain": "FlexRIC",
+                "source_doc": file.filename,
+                "created_at": get_rfc3339_time(),
+                "user": "system"
+            },
+            "vector": vector
+        }
+        res = requests.post(WEAVIATE_OBJECTS_URL, json=obj)
+        success += 1 if res.status_code == 200 else 0
+
+    return {
+        "filename": file.filename,
+        "total": len(text_blocks),
+        "success": success,
+        "fail": fail
+    }
+
+# 8. 查詢使用者記憶
+@app.get("/history/{user}")
+def user_history(user: str):
+    query = {
+        "query": f"""
+        {{
+          Get {{
+            Knowledge(where: {{path: [\"user\"], operator: Equal, valueText: \"{user}\"}}) {{
+              text created_at type tag domain
+            }}
+          }}
+        }}"""
+    }
+    return requests.post(WEAVIATE_GRAPHQL_URL, json=query).json()
+
+# 9. 清理過期記憶
+@app.delete("/clean_old")
+def clean_old(days: int = 30):
+    cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat(timespec="seconds") + "Z"
+    query = {
+        "query": f"""
+        {{
+          Get {{
+            Knowledge(where: {{path: [\"created_at\"], operator: LessThan, valueDate: \"{cutoff}\"}}) {{
+              _additional {{ id }}
+            }}
+          }}
+        }}"""
+    }
+    resp = requests.post(WEAVIATE_GRAPHQL_URL, json=query).json()
+    knowledge_data = resp.get("data", {}).get("Get", {}).get("Knowledge", [])
+    if not knowledge_data:
+        return {"deleted_count": 0, "cutoff": cutoff, "note": "No expired memory found."}
+
+    deleted = 0
+    for item in knowledge_data:
+        id_ = item["_additional"]["id"]
+        requests.delete(f"{WEAVIATE_OBJECTS_URL}/{id_}")
+        deleted += 1
+    return {"deleted_count": deleted, "cutoff": cutoff}
