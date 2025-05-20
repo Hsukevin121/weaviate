@@ -8,7 +8,9 @@ import logging
 from fastapi.middleware.cors import CORSMiddleware
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import torch
+import uuid
 from docx import Document
+import tiktoken
 
 # 設定 logger
 logging.basicConfig(level=logging.INFO)
@@ -37,7 +39,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-OLLAMA_URL = "http://192.168.31.124:11434/api"
+OLLAMA_URL = "http://10.8.0.26:11434/api"
 WEAVIATE_OBJECTS_URL = "http://localhost:8080/v1/objects"
 WEAVIATE_GRAPHQL_URL = "http://localhost:8080/v1/graphql"
 
@@ -47,9 +49,25 @@ def get_rfc3339_time():
 @app.post("/remember")
 def remember(data: dict = Body(...)):
     try:
-        text = data["text"]
-        vector = requests.post(f"{OLLAMA_URL}/embeddings", json={"model": "nomic-embed-text", "prompt": text}).json()["embedding"]
+        text = data.get("text")
+        if not text:
+            return {"error": "Missing 'text' field"}
+
+        # === 1. 呼叫 embedding 模型 ===
+        emb_response = requests.post(
+            f"{OLLAMA_URL}/embeddings",
+            json={"model": "nomic-embed-text", "prompt": text}
+        )
+        emb_json = emb_response.json()
+        vector = emb_json.get("embedding")
+
+        if not vector or not isinstance(vector, list):
+            logger.error(f"[embedding error] response: {emb_json}")
+            return {"error": "embedding failed", "response": emb_json}
+
+        # === 2. 準備 Weaviate 物件 ===
         obj = {
+            "id": str(uuid.uuid4()),
             "class": "Knowledge",
             "properties": {
                 "text": text,
@@ -59,14 +77,25 @@ def remember(data: dict = Body(...)):
                 "source_doc": data.get("source_doc", "chat"),
                 "created_at": data.get("created_at", get_rfc3339_time()),
                 "related_event": data.get("related_event", ""),
-                "user": data.get("user", "default")
+                "user": data.get("user", "default"),
+                "certainty": data.get("certainty", 1.0)
             },
             "vector": vector
         }
-        return requests.post(WEAVIATE_OBJECTS_URL, json=obj).json()
+
+        # === 3. 寫入 Weaviate ===
+        headers = {"Content-Type": "application/json"}
+        res = requests.post(WEAVIATE_OBJECTS_URL, json=obj, headers=headers)
+
+        if res.status_code >= 300:
+            logger.error(f"[weaviate insert error] {res.status_code} {res.text}")
+            return {"error": "weaviate insertion failed", "response": res.text}
+
+        return {"message": "success", "id": obj["id"], "weaviate_response": res.json()}
+
     except Exception as e:
-        logger.error(f"[remember] error: {e}")
-        return {"error": "embedding or insertion failed", "exception": str(e)}
+        logger.exception("[remember] unexpected error")
+        return {"error": "unexpected failure", "exception": str(e)}
 
 @app.post("/recall")
 def recall(data: dict = Body(...)):
@@ -167,55 +196,89 @@ def query_by_filter(data: dict = Body(...)):
     return requests.post(WEAVIATE_GRAPHQL_URL, json=query).json()
 
 # 7. PDF 拆段上傳
+def split_into_chunks(text: str, max_tokens=200, overlap=50):
+    enc = tiktoken.get_encoding("cl100k_base")
+    tokens = enc.encode(text)
+    chunks = []
+    start = 0
+
+    while start < len(tokens):
+        chunk = tokens[start:start + max_tokens]
+        decoded_chunk = enc.decode(chunk)
+        chunks.append(decoded_chunk)
+        start += max_tokens - overlap
+
+    return chunks
+
 @app.post("/upload_file")
 def upload_file(file: UploadFile):
-    text_blocks = []
     filename = file.filename.lower()
+    ext = filename.split(".")[-1]
+    full_text = ""
 
+    # === Step 1: 擷取全文文字 ===
     if filename.endswith(".pdf"):
         doc = fitz.open(stream=file.file.read(), filetype="pdf")
         for page in doc:
-            text_blocks += [p.strip() for p in page.get_text().split("\n") if len(p.strip()) >= 30]
+            full_text += page.get_text() + "\n"
 
     elif filename.endswith(".docx"):
         doc = Document(file.file)
-        for para in doc.paragraphs:
-            if len(para.text.strip()) >= 30:
-                text_blocks.append(para.text.strip())
+        full_text = "\n".join([para.text for para in doc.paragraphs])
 
     elif filename.endswith(".txt"):
         content = file.file.read().decode("utf-8")
-        text_blocks += [line.strip() for line in content.split("\n") if len(line.strip()) >= 30]
+        full_text = content
 
     else:
         return {"error": "Unsupported file type"}
 
+    # === Step 2: 切成語意片段 ===
+    text_blocks = split_into_chunks(full_text)
+
     success, fail = 0, 0
-    for block in text_blocks:
-        emb_res = requests.post(f"{OLLAMA_URL}/embeddings", json={"model": "nomic-embed-text", "prompt": block})
-        if emb_res.status_code != 200:
+    for i, block in enumerate(text_blocks):
+        try:
+            emb_res = requests.post(f"{OLLAMA_URL}/embeddings", json={
+                "model": "nomic-embed-text",
+                "prompt": block
+            })
+
+            if emb_res.status_code != 200:
+                print(f"❌ Failed to embed chunk {i}")
+                fail += 1
+                continue
+
+            vector = emb_res.json()["embedding"]
+            obj = {
+                "class": "Knowledge",
+                "properties": {
+                    "text": block,
+                    "type": "doc",
+                    "tag": [ext],
+                    "domain": "O-RAN",
+                    "source_doc": file.filename,
+                    "chunk_index": i,
+                    "created_at": get_rfc3339_time(),
+                    "user": "system"
+                },
+                "vector": vector
+            }
+
+            res = requests.post(WEAVIATE_OBJECTS_URL, json=obj)
+            if res.status_code == 200:
+                success += 1
+            else:
+                print(f"❌ Weaviate insert failed for chunk {i}: {res.text}")
+                fail += 1
+
+        except Exception as e:
+            print(f"⚠️ Chunk {i} failed: {e}")
             fail += 1
-            continue
-        vector = emb_res.json()["embedding"]
-        obj = {
-            "class": "Knowledge",
-            "properties": {
-                "text": block,
-                "type": "doc",
-                "tag": [filename.split(".")[-1]],  # 使用檔案副檔名作為 tag (pdf, docx, txt)
-                "domain": "FlexRIC",
-                "source_doc": file.filename,
-                "created_at": get_rfc3339_time(),
-                "user": "system"
-            },
-            "vector": vector
-        }
-        res = requests.post(WEAVIATE_OBJECTS_URL, json=obj)
-        success += 1 if res.status_code == 200 else 0
 
     return {
         "filename": file.filename,
-        "total": len(text_blocks),
+        "total_chunks": len(text_blocks),
         "success": success,
         "fail": fail
     }
@@ -239,24 +302,47 @@ def user_history(user: str):
 @app.delete("/clean_old")
 def clean_old(days: int = 30):
     cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat(timespec="seconds") + "Z"
-    query = {
-        "query": f"""
-        {{
-          Get {{
-            Knowledge(where: {{path: [\"created_at\"], operator: LessThan, valueDate: \"{cutoff}\"}}) {{
-              _additional {{ id }}
-            }}
-          }}
-        }}"""
-    }
-    resp = requests.post(WEAVIATE_GRAPHQL_URL, json=query).json()
-    knowledge_data = resp.get("data", {}).get("Get", {}).get("Knowledge", [])
-    if not knowledge_data:
-        return {"deleted_count": 0, "cutoff": cutoff, "note": "No expired memory found."}
-
     deleted = 0
-    for item in knowledge_data:
-        id_ = item["_additional"]["id"]
-        requests.delete(f"{WEAVIATE_OBJECTS_URL}/{id_}")
-        deleted += 1
-    return {"deleted_count": deleted, "cutoff": cutoff}
+    limit = 100
+    after = None
+
+    while True:
+        # 建立 GraphQL 查詢字串（加上 after 分頁游標）
+        after_clause = f', after: "{after}"' if after else ""
+        query = {
+            "query": f"""{{
+                Get {{
+                    Knowledge(
+                        where: {{
+                            path: ["created_at"],
+                            operator: LessThan,
+                            valueDate: "{cutoff}"
+                        }},
+                        limit: {limit}{after_clause}
+                    ) {{
+                        _additional {{ id }}
+                    }}
+                }}
+            }}"""
+        }
+
+        # 執行查詢
+        response = requests.post(WEAVIATE_GRAPHQL_URL, json=query).json()
+        objects = response.get("data", {}).get("Get", {}).get("Knowledge", [])
+
+        if not objects:
+            break  # 沒有更多資料了
+
+        for obj in objects:
+            obj_id = obj["_additional"]["id"]
+            requests.delete(f"{WEAVIATE_OBJECTS_URL}/Knowledge/{obj_id}")
+            deleted += 1
+
+        # 分頁：以最後一筆資料為 after 游標
+        after = objects[-1]["_additional"]["id"]
+
+    return {
+        "deleted_count": deleted,
+        "cutoff": cutoff,
+        "note": "All expired memory deleted completely."
+    }
