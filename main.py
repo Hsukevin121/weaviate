@@ -12,6 +12,11 @@ import uuid
 from docx import Document
 import tiktoken
 
+from sentence_transformers import SentenceTransformer
+
+EMBED_MODEL_PATH = "/home/smo/bge-small-en-v1.5"
+embed_model = SentenceTransformer(EMBED_MODEL_PATH)
+
 # 設定 logger
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -46,6 +51,77 @@ WEAVIATE_GRAPHQL_URL = "http://localhost:8080/v1/graphql"
 def get_rfc3339_time():
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
+# 總結策略
+@app.post("/record_result")
+def record_result(data: dict = Body(...)):
+    try:
+        # 基本欄位取得
+        summary = data["summary"]
+        strategy = data.get("strategy", {})
+        kpi = data.get("kpi_result", {})
+        success = data.get("success", True)
+        user = data.get("user", "Kevin")
+        source_doc = data.get("source_doc", "unknown")
+        task_type = data.get("task_type", "xapp_result")
+        type_ = data.get("type", task_type)
+        strategy_id = data.get("strategy_id", str(uuid.uuid4()))
+        retrieved_doc_id = data.get("retrieved_doc_id", None)
+
+        # 組合 tag
+        tag = [f"{k}={v}" for k, v in strategy.items()]
+        if success is not None:
+            tag.append("success" if success else "fail")
+
+        if retrieved_doc_id:
+            tag.append("retrieved")
+
+        # 向量化 summary
+        vector = embed_model.encode(summary).tolist()
+
+
+        if not vector or not isinstance(vector, list):
+            return {"error": "embedding failed", "response": emb_json}
+
+        # 組合 Weaviate 物件
+        record = {
+            "id": strategy_id,
+            "class": "Knowledge",
+            "properties": {
+                "text": summary,
+                "type": type_,
+                "tag": tag,
+                "domain": "xapp/test",
+                "source_doc": source_doc,
+                "created_at": get_rfc3339_time(),
+                "related_event": data.get("related_event", task_type),
+                "user": user,
+                "certainty": data.get("certainty", 1.0 if success else 0.5),
+                "strategy_id": strategy_id,
+                "retrieved_doc_id": retrieved_doc_id
+            },
+            "vector": vector
+        }
+
+        # 寫入 Weaviate
+        res = requests.post(WEAVIATE_OBJECTS_URL, json=record)
+        print("[Weaviate Write] status:", res.status_code)
+        print("[Weaviate Write] response:", res.text)
+        if res.status_code >= 300:
+            return {"error": "weaviate insert failed", "response": res.text}
+
+        return {
+            "message": "success",
+            "id": strategy_id,
+            "type": type_,
+            "task_type": task_type,
+            "source_doc": source_doc
+        }
+
+    except Exception as e:
+        logger.exception("[record_result] unexpected error")
+        return {"error": "unexpected failure", "exception": str(e)}
+
+
 @app.post("/remember")
 def remember(data: dict = Body(...)):
     try:
@@ -54,12 +130,8 @@ def remember(data: dict = Body(...)):
             return {"error": "Missing 'text' field"}
 
         # === 1. 呼叫 embedding 模型 ===
-        emb_response = requests.post(
-            f"{OLLAMA_URL}/embeddings",
-            json={"model": "nomic-embed-text", "prompt": text}
-        )
-        emb_json = emb_response.json()
-        vector = emb_json.get("embedding")
+        vector = embed_model.encode(text).tolist()
+
 
         if not vector or not isinstance(vector, list):
             logger.error(f"[embedding error] response: {emb_json}")
@@ -101,8 +173,8 @@ def remember(data: dict = Body(...)):
 def recall(data: dict = Body(...)):
     try:
         query = data["text"]
-        emb = requests.post(f"{OLLAMA_URL}/embeddings", json={"model": "nomic-embed-text", "prompt": query}).json()
-        vector = emb["embedding"]
+        vector = embed_model.encode(query).tolist()
+
 
         query_body = {
             "query": f"""
@@ -128,6 +200,62 @@ def recall(data: dict = Body(...)):
     except Exception as e:
         logger.error(f"[recall] error: {e}")
         return {"error": "recall failed", "exception": str(e)}
+
+# 簡單向量 recall
+@app.post("/recall_sample_vector")
+def recall_sample_vector(data: dict = Body(...)):
+    try:
+        query = data["text"]
+        top_k = data.get("top_k", 10)
+        threshold = data.get("threshold", 0.75)
+
+        # 向量化輸入查詢
+        vector = embed_model.encode(query).tolist()
+
+        # 向量查詢語法
+        query_body = {
+            "query": f"""
+            {{
+              Get {{
+                Knowledge(nearVector: {{ vector: {vector} }}, limit: {top_k}) {{
+                  text
+                  source_doc
+                  created_at
+                  _additional {{ id certainty }}
+                }}
+              }}
+            }}"""
+        }
+
+        # 執行 Weaviate 查詢
+        res = requests.post(WEAVIATE_GRAPHQL_URL, json=query_body).json()
+        candidates = res.get("data", {}).get("Get", {}).get("Knowledge", [])
+
+        # 篩選高信心結果
+        filtered = [
+            {
+                "id": c["_additional"]["id"],
+                "certainty": round(c["_additional"].get("certainty", 0), 4),
+                "text": c["text"],
+                "source_doc": c.get("source_doc"),
+                "created_at": c.get("created_at")
+            }
+            for c in candidates if c["_additional"].get("certainty", 0) >= threshold
+        ]
+
+        return {
+            "query": query,
+            "top_k": top_k,
+            "threshold": threshold,
+            "match_count": len(filtered),
+            "matches": filtered
+        }
+
+    except Exception as e:
+        logger.error(f"[recall_sample_vector] error: {e}")
+        return {"error": "vector recall failed", "exception": str(e)}
+
+
 
 # 3. 手動標記
 @app.post("/label")
@@ -239,17 +367,8 @@ def upload_file(file: UploadFile):
     success, fail = 0, 0
     for i, block in enumerate(text_blocks):
         try:
-            emb_res = requests.post(f"{OLLAMA_URL}/embeddings", json={
-                "model": "nomic-embed-text",
-                "prompt": block
-            })
+            vector = embed_model.encode(block).tolist()
 
-            if emb_res.status_code != 200:
-                print(f"❌ Failed to embed chunk {i}")
-                fail += 1
-                continue
-
-            vector = emb_res.json()["embedding"]
             obj = {
                 "class": "Knowledge",
                 "properties": {
