@@ -206,7 +206,7 @@ def recall(data: dict = Body(...)):
 def recall_sample_vector(data: dict = Body(...)):
     try:
         query = data["text"]
-        top_k = data.get("top_k", 10)
+        top_k = data.get("top_k", 3)
         threshold = data.get("threshold", 0.75)
 
         # 向量化輸入查詢
