@@ -55,7 +55,6 @@ def get_rfc3339_time():
 @app.post("/record_result")
 def record_result(data: dict = Body(...)):
     try:
-        # 基本欄位取得
         summary = data["summary"]
         strategy = data.get("strategy", {})
         kpi = data.get("kpi_result", {})
@@ -71,20 +70,19 @@ def record_result(data: dict = Body(...)):
         tag = [f"{k}={v}" for k, v in strategy.items()]
         if success is not None:
             tag.append("success" if success else "fail")
-
         if retrieved_doc_id:
             tag.append("retrieved")
 
         # 向量化 summary
         vector = embed_model.encode(summary).tolist()
-
-
         if not vector or not isinstance(vector, list):
-            return {"error": "embedding failed", "response": emb_json}
+            return {"error": "embedding failed", "response": vector}
 
-        # 組合 Weaviate 物件
+        # ✅ 將 strategy 轉為 JSON 字串
+        strategy_text = json.dumps(strategy)
+
         record = {
-            "id": strategy_id,
+            "id": str(uuid.uuid4()),  # Weaviate 的 id 必須為 UUID
             "class": "Knowledge",
             "properties": {
                 "text": summary,
@@ -97,12 +95,14 @@ def record_result(data: dict = Body(...)):
                 "user": user,
                 "certainty": data.get("certainty", 1.0 if success else 0.5),
                 "strategy_id": strategy_id,
-                "retrieved_doc_id": retrieved_doc_id
+                "retrieved_doc_id": retrieved_doc_id,
+                "strategy": strategy_text,   # ✅ 修正這裡
+                "success": success,
+                "summary": summary
             },
             "vector": vector
         }
 
-        # 寫入 Weaviate
         res = requests.post(WEAVIATE_OBJECTS_URL, json=record)
         print("[Weaviate Write] status:", res.status_code)
         print("[Weaviate Write] response:", res.text)
@@ -118,7 +118,8 @@ def record_result(data: dict = Body(...)):
         }
 
     except Exception as e:
-        logger.exception("[record_result] unexpected error")
+        import traceback
+        traceback.print_exc()
         return {"error": "unexpected failure", "exception": str(e)}
 
 
